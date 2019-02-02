@@ -162,6 +162,8 @@ struct InodeStat {
     decode(dirstat.nfiles, p);
     decode(dirstat.nsubdirs, p);
     decode(rstat.rbytes, p);
+    decode(rstat.user_rbytes, p);
+    decode(rstat.group_rbytes, p);
     decode(rstat.rfiles, p);
     decode(rstat.rsubdirs, p);
     decode(rstat.rctime, p);

@@ -63,6 +63,8 @@
 #include <list>
 #include <iostream>
 #include <string_view>
+#include <pwd.h>
+#include <sys/types.h>
 
 #include "common/config.h"
 
@@ -4381,10 +4383,25 @@ void Server::handle_client_setattr(MDRequestRef& mdr)
 
   auto &pi = cur->project_inode();
 
-  if (mask & CEPH_SETATTR_UID)
+  if (mask & CEPH_SETATTR_UID) {
+    uid_t old_uid = pi.inode.uid;
     pi.inode.uid = req->head.args.setattr.uid;
-  if (mask & CEPH_SETATTR_GID)
+    if (pi.inode.is_file() && pi.inode.rstat.user_rbytes.count(old_uid)) {
+      int64_t rbytes = pi.inode.rstat.user_rbytes[old_uid];
+      pi.inode.rstat.user_rbytes.erase(old_uid);
+      pi.inode.rstat.user_rbytes[pi.inode.uid] = rbytes;
+    }
+  }
+
+  if (mask & CEPH_SETATTR_GID) {
+    gid_t old_gid = pi.inode.gid;
     pi.inode.gid = req->head.args.setattr.gid;
+    if (pi.inode.is_file() && pi.inode.rstat.group_rbytes.count(old_gid)) {
+      int64_t rbytes = pi.inode.rstat.group_rbytes[old_gid];
+      pi.inode.rstat.group_rbytes.erase(old_gid);
+      pi.inode.rstat.group_rbytes[pi.inode.gid] = rbytes;
+    }
+  }
 
   if (mask & CEPH_SETATTR_MODE)
     pi.inode.mode = (pi.inode.mode & ~07777) | (req->head.args.setattr.mode & 07777);
@@ -4409,6 +4426,8 @@ void Server::handle_client_setattr(MDRequestRef& mdr)
     } else {
       pi.inode.size = req->head.args.setattr.size;
       pi.inode.rstat.rbytes = pi.inode.size;
+      pi.inode.rstat.user_rbytes[pi.inode.uid] = pi.inode.size;
+      pi.inode.rstat.group_rbytes[pi.inode.gid] = pi.inode.size;
     }
     pi.inode.mtime = mdr->get_op_stamp();
 
@@ -4750,8 +4769,8 @@ int Server::parse_quota_vxattr(string name, string value, quota_info_t *quota)
       string::iterator begin = value.begin();
       string::iterator end = value.end();
       if (begin == end) {
-	// keep quota unchanged. (for create_quota_realm())
-	return 0;
+        // keep quota unchanged. (for create_quota_realm())
+        return 0;
       }
       keys_and_values<string::iterator> p;    // create instance of parser
       std::map<string, string> m;             // map to receive results
@@ -4793,6 +4812,123 @@ int Server::parse_quota_vxattr(string name, string value, quota_info_t *quota)
   return 0;
 }
 
+int Server::parse_user_quota_vxattr(string name, string value, quota_info_t *quota)
+{
+  dout(20) << "parse_user_quota_vxattr name " << name << " value '" << value << "'" << dendl;
+  int64_t uid;
+  try {
+    if (name == "user_quota") {
+      string::iterator begin = value.begin();
+      string::iterator end = value.end();
+      if (begin == end) {
+        // keep quota unchanged. (for create_user_quota_realm())
+        return 0;
+      }
+      keys_and_values<string::iterator> p;    // create instance of parser
+      std::map<string, string> m;             // map to receive results
+      if (!qi::parse(begin, end, p, m)) {     // returns true if successful
+        return -EINVAL;
+      }
+      string left(begin, end);
+      dout(10) << " parsed " << m << " left '" << left << "'" << dendl;
+      if (begin != end)
+        return -EINVAL;
+      for (map<string,string>::iterator q = m.begin(); q != m.end(); ++q) {
+        int r = parse_user_quota_vxattr(string("user_quota.") + q->first, q->second, quota);
+        if (r < 0)
+          return r;
+      }
+    } else {
+      string cp = name.substr(name.find("@")+1);
+      if (cp.size()==0)
+        return -EINVAL;
+
+      string sub_name = name.substr(0, name.find("@"));
+      if (sub_name == "user_quota.max_bytes") {
+        uid = boost::lexical_cast<int64_t>(cp);
+        int64_t q = boost::lexical_cast<int64_t>(value);
+        if (q < 0)
+          return -EINVAL;
+        quota->user_max_bytes[uid] = q;
+
+        if (0 == quota->user_max_bytes[uid])
+          quota->user_max_bytes.erase(uid);
+      } else {
+        dout(10) << " unknown user_quota vxattr " << name << dendl;
+        return -EINVAL;
+      }
+    }
+  } catch (boost::bad_lexical_cast const&) {
+    dout(10) << "bad vxattr value, unable to parse int for " << name << dendl;
+    return -EINVAL;
+  }
+
+  if (!quota->is_user_valid(uid)) {
+    dout(10) << "bad user quota" << dendl;
+    return -EINVAL;
+  }
+  return 0;
+}
+
+int Server::parse_group_quota_vxattr(string name, string value, quota_info_t *quota)
+{
+  dout(20) << "parse_group_quota_vxattr name " << name << " value '" << value << "'" << dendl;
+  int64_t gid;
+  try {
+    if (name == "group_quota") {
+      string::iterator begin = value.begin();
+      string::iterator end = value.end();
+      if (begin == end) {
+        // keep quota unchanged. (for create_group_quota_realm())
+        return 0;
+      }
+      keys_and_values<string::iterator> p;    // create instance of parser
+      std::map<string, string> m;             // map to receive results
+      if (!qi::parse(begin, end, p, m)) {     // returns true if successful
+        return -EINVAL;
+      }
+      string left(begin, end);
+      dout(10) << " parsed " << m << " left '" << left << "'" << dendl;
+      if (begin != end)
+        return -EINVAL;
+      for (map<string,string>::iterator q = m.begin(); q != m.end(); ++q) {
+        int r = parse_group_quota_vxattr(string("group_quota.") + q->first, q->second, quota);
+        if (r < 0)
+          return r;
+      }
+    } else {
+      string cp = name.substr(name.find("@")+1);
+      if (cp.size()==0)
+        return -EINVAL;
+
+      string sub_name = name.substr(0, name.find("@"));
+      if(sub_name == "group_quota.max_bytes"){
+        gid = boost::lexical_cast<int64_t>(cp);
+        int64_t q = boost::lexical_cast<int64_t>(value);
+        if (q < 0)
+          return -EINVAL;
+        quota->group_max_bytes[gid] = q;
+
+        if (0 == quota->group_max_bytes[gid])
+          quota->group_max_bytes.erase(gid);
+      } else {
+        dout(10) << " unknown group_quota vxattr " << name << dendl;
+        return -EINVAL;
+      }
+    }
+  } catch (boost::bad_lexical_cast const&) {
+    dout(10) << "bad vxattr value, unable to parse int for " << name << dendl;
+    return -EINVAL;
+  }
+
+  if (!quota->is_group_valid(gid)) {
+    dout(10) << "bad group quota" << dendl;
+    return -EINVAL;
+  }
+  return 0;
+}
+
+
 void Server::create_quota_realm(CInode *in)
 {
   dout(10) << __func__ << " " << *in << dendl;
@@ -4800,6 +4936,32 @@ void Server::create_quota_realm(CInode *in)
   MClientRequest *req = new MClientRequest(CEPH_MDS_OP_SETXATTR);
   req->set_filepath(filepath(in->ino()));
   req->set_string2("ceph.quota");
+  // empty vxattr value
+  req->set_tid(mds->issue_tid());
+
+  mds->send_message_mds(req, in->authority().first);
+}
+
+void Server::create_user_quota_realm(CInode *in)
+{
+  dout(10) << __func__ << " " << *in << dendl;
+
+  MClientRequest *req = new MClientRequest(CEPH_MDS_OP_SETXATTR);
+  req->set_filepath(filepath(in->ino()));
+  req->set_string2("ceph.user_quota");
+  // empty vxattr value
+  req->set_tid(mds->issue_tid());
+
+  mds->send_message_mds(req, in->authority().first);
+}
+
+void Server::create_group_quota_realm(CInode *in)
+{
+  dout(10) << __func__ << " " << *in << dendl;
+
+  MClientRequest *req = new MClientRequest(CEPH_MDS_OP_SETXATTR);
+  req->set_filepath(filepath(in->ino()));
+  req->set_string2("ceph.group_quota");
   // empty vxattr value
   req->set_tid(mds->issue_tid());
 
@@ -4965,6 +5127,84 @@ void Server::handle_set_vxattr(MDRequestRef& mdr, CInode *cur,
 
     xlocks.insert(&cur->policylock);
     if (quota.is_enable() && !cur->get_projected_srnode()) {
+      xlocks.insert(&cur->snaplock);
+      new_realm = true;
+    }
+
+    if (!mds->locker->acquire_locks(mdr, rdlocks, wrlocks, xlocks))
+      return;
+
+    auto &pi = cur->project_inode(false, new_realm);
+    pi.inode.quota = quota;
+
+    if (new_realm) {
+      SnapRealm *realm = cur->find_snaprealm();
+      auto seq = realm->get_newest_seq();
+      auto &newsnap = *pi.snapnode;
+      newsnap.created = seq;
+      newsnap.seq = seq;
+    }
+    mdr->no_early_reply = true;
+    pip = &pi.inode;
+
+    client_t exclude_ct = mdr->get_client();
+    mdcache->broadcast_quota_to_client(cur, exclude_ct);
+  } else if (name.compare(0, 15, "ceph.user_quota") == 0) {
+    if (!cur->is_dir() || cur->is_root()) {
+      respond_to_request(mdr, -EINVAL);
+      return;
+    }
+
+    quota_info_t quota = cur->get_projected_inode()->quota;
+
+    rest = name.substr(5);
+    int r = parse_user_quota_vxattr(rest, value, &quota);
+    if (r < 0) {
+      respond_to_request(mdr, r);
+      return;
+    }
+
+    xlocks.insert(&cur->policylock);
+    if (quota.is_user_enable() && !cur->get_projected_srnode()) {
+      xlocks.insert(&cur->snaplock);
+      new_realm = true;
+    }
+
+    if (!mds->locker->acquire_locks(mdr, rdlocks, wrlocks, xlocks))
+      return;
+
+    auto &pi = cur->project_inode(false, new_realm);
+    pi.inode.quota = quota;
+
+    if (new_realm) {
+      SnapRealm *realm = cur->find_snaprealm();
+      auto seq = realm->get_newest_seq();
+      auto &newsnap = *pi.snapnode;
+      newsnap.created = seq;
+      newsnap.seq = seq;
+    }
+    mdr->no_early_reply = true;
+    pip = &pi.inode;
+
+    client_t exclude_ct = mdr->get_client();
+    mdcache->broadcast_quota_to_client(cur, exclude_ct);
+  } else if (name.compare(0, 16, "ceph.group_quota") == 0) {
+    if (!cur->is_dir() || cur->is_root()) {
+      respond_to_request(mdr, -EINVAL);
+      return;
+    }
+
+    quota_info_t quota = cur->get_projected_inode()->quota;
+
+    rest = name.substr(5);
+    int r = parse_group_quota_vxattr(rest, value, &quota);
+    if (r < 0) {
+      respond_to_request(mdr, r);
+      return;
+    }
+
+    xlocks.insert(&cur->policylock);
+    if (quota.is_group_enable() && !cur->get_projected_srnode()) {
       xlocks.insert(&cur->snaplock);
       new_realm = true;
     }
@@ -5533,6 +5773,8 @@ void Server::handle_client_symlink(MDRequestRef& mdr)
   newi->symlink = req->get_path2();
   newi->inode.size = newi->symlink.length();
   newi->inode.rstat.rbytes = newi->inode.size;
+  newi->inode.rstat.user_rbytes[newi->inode.uid] = newi->inode.size;
+  newi->inode.rstat.group_rbytes[newi->inode.gid] = newi->inode.size;
   newi->inode.rstat.rfiles = 1;
   newi->inode.version = dn->pre_dirty();
   newi->inode.update_backtrace();
@@ -8580,6 +8822,8 @@ void _rollback_repair_dir(MutationRef& mut, CDir *dir, rename_rollback::drec &r,
     pf->rstat.rfiles += linkunlink * rstat.rfiles;
     pf->rstat.rsubdirs += linkunlink * rstat.rsubdirs;
     pf->rstat.rsnaps += linkunlink * rstat.rsnaps;
+    pf->rstat.user_rbytes_add(rstat.user_rbytes, linkunlink);
+    pf->rstat.group_rbytes_add(rstat.group_rbytes, linkunlink);
   }
   if (pf->fragstat.mtime == ctime) {
     pf->fragstat.mtime = r.dirfrag_old_mtime;

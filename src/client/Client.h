@@ -573,6 +573,20 @@ protected:
   bool is_quota_bytes_exceeded(Inode *in, int64_t new_bytes,
 			       const UserPerm& perms);
   bool is_quota_bytes_approaching(Inode *in, const UserPerm& perms);
+  Inode* get_user_quota_root(Inode *in);
+  Inode* get_user_quota_root(Inode *in, uid_t uid);
+  bool check_user_quota_condition(Inode *in, uid_t uid,
+			     std::function<bool (Inode &)> test);
+  bool is_user_quota_bytes_exceeded(Inode *in, int64_t new_bytes,
+               const UserPerm& perms, bool flag);
+  bool is_user_quota_bytes_approaching(Inode *in, const UserPerm& perms, bool flag);
+  Inode* get_group_quota_root(Inode *in);
+  Inode* get_group_quota_root(Inode *in, gid_t gid);
+  bool check_group_quota_condition(Inode *in, gid_t gid,
+      std::function<bool (Inode &)> test);
+  bool is_group_quota_bytes_exceeded(Inode *in, int64_t new_bytes,
+      const UserPerm& perms, bool flag);
+  bool is_group_quota_bytes_approaching(Inode *in, const UserPerm& perms, bool flag);
 
   std::map<std::pair<int64_t,std::string>, int> pool_perms;
   list<Cond*> waiting_for_pool_perm;
@@ -882,36 +896,43 @@ private:
    */
   struct VXattr {
 	  const string name;
-	  size_t (Client::*getxattr_cb)(Inode *in, char *val, size_t size);
+	  size_t (Client::*getxattr_cb)(Inode *in, char *val, size_t size, const char *name);
 	  bool readonly, hidden;
-	  bool (Client::*exists_cb)(Inode *in);
+	  bool (Client::*exists_cb)(Inode *in, const char *name);
 	  int flags;
   };
 
 /* Flags for VXattr */
 #define VXATTR_RSTAT 0x1
 
-  bool _vxattrcb_quota_exists(Inode *in);
-  size_t _vxattrcb_quota(Inode *in, char *val, size_t size);
-  size_t _vxattrcb_quota_max_bytes(Inode *in, char *val, size_t size);
-  size_t _vxattrcb_quota_max_files(Inode *in, char *val, size_t size);
-
-  bool _vxattrcb_layout_exists(Inode *in);
-  size_t _vxattrcb_layout(Inode *in, char *val, size_t size);
-  size_t _vxattrcb_layout_stripe_unit(Inode *in, char *val, size_t size);
-  size_t _vxattrcb_layout_stripe_count(Inode *in, char *val, size_t size);
-  size_t _vxattrcb_layout_object_size(Inode *in, char *val, size_t size);
-  size_t _vxattrcb_layout_pool(Inode *in, char *val, size_t size);
-  size_t _vxattrcb_layout_pool_namespace(Inode *in, char *val, size_t size);
-  size_t _vxattrcb_dir_entries(Inode *in, char *val, size_t size);
-  size_t _vxattrcb_dir_files(Inode *in, char *val, size_t size);
-  size_t _vxattrcb_dir_subdirs(Inode *in, char *val, size_t size);
-  size_t _vxattrcb_dir_rentries(Inode *in, char *val, size_t size);
-  size_t _vxattrcb_dir_rfiles(Inode *in, char *val, size_t size);
-  size_t _vxattrcb_dir_rsubdirs(Inode *in, char *val, size_t size);
-  size_t _vxattrcb_dir_rbytes(Inode *in, char *val, size_t size);
-  size_t _vxattrcb_dir_rctime(Inode *in, char *val, size_t size);
+  bool _vxattrcb_quota_exists(Inode *in, const char *name);
+  size_t _vxattrcb_quota(Inode *in, char *val, size_t size, const char *name);
+  size_t _vxattrcb_quota_max_bytes(Inode *in, char *val, size_t size, const char *name);
+  size_t _vxattrcb_quota_max_files(Inode *in, char *val, size_t size, const char *name);
+  bool _vxattrcb_user_quota_exists(Inode *in, const char *name);
+  size_t _vxattrcb_user_quota(Inode *in, char *val, size_t size, const char *name);
+  size_t _vxattrcb_user_quota_max_bytes(Inode *in, char *val, size_t size, const char *name);
+  bool _vxattrcb_group_quota_exists(Inode *in, const char *name);
+  size_t _vxattrcb_group_quota(Inode *in, char *val, size_t size, const char *name);
+  size_t _vxattrcb_group_quota_max_bytes(Inode *in, char *val, size_t size, const char *name);
+  bool _vxattrcb_layout_exists(Inode *in, const char *name);
+  size_t _vxattrcb_layout(Inode *in, char *val, size_t size, const char *name);
+  size_t _vxattrcb_layout_stripe_unit(Inode *in, char *val, size_t size, const char *name);
+  size_t _vxattrcb_layout_stripe_count(Inode *in, char *val, size_t size, const char *name);
+  size_t _vxattrcb_layout_object_size(Inode *in, char *val, size_t size, const char *name);
+  size_t _vxattrcb_layout_pool(Inode *in, char *val, size_t size, const char *name);
+  size_t _vxattrcb_layout_pool_namespace(Inode *in, char *val, size_t size, const char *name);
+  size_t _vxattrcb_dir_entries(Inode *in, char *val, size_t size, const char *name);
+  size_t _vxattrcb_dir_files(Inode *in, char *val, size_t size, const char *name);
+  size_t _vxattrcb_dir_subdirs(Inode *in, char *val, size_t size, const char *name);
+  size_t _vxattrcb_dir_rentries(Inode *in, char *val, size_t size, const char *name);
+  size_t _vxattrcb_dir_rfiles(Inode *in, char *val, size_t size, const char *name);
+  size_t _vxattrcb_dir_rsubdirs(Inode *in, char *val, size_t size, const char *name);
+  size_t _vxattrcb_dir_rbytes(Inode *in, char *val, size_t size, const char *name);
+  size_t _vxattrcb_dir_rctime(Inode *in, char *val, size_t size, const char *name);
   size_t _vxattrs_calcu_name_size(const VXattr *vxattrs);
+  size_t _vxattrcb_dir_user_rbytes(Inode *in, char *val, size_t size, const char *name);
+  size_t _vxattrcb_dir_group_rbytes(Inode *in, char *val, size_t size, const char *name);
 
   static const VXattr _dir_vxattrs[];
   static const VXattr _file_vxattrs[];

@@ -6680,8 +6680,9 @@ int Client::_do_setattr(Inode *in, struct ceph_statx *stx, int mask,
   }
   if ((mask & CEPH_SETATTR_SIZE) &&
       (unsigned long)stx->stx_size > in->size &&
-      is_quota_bytes_exceeded(in, (unsigned long)stx->stx_size - in->size,
-			      perms)) {
+      (is_quota_bytes_exceeded(in, (unsigned long)stx->stx_size - in->size, perms) ||
+       is_user_quota_bytes_exceeded(in, (unsigned long)stx->stx_size - in->size, perms, false) ||
+       is_group_quota_bytes_exceeded(in, (unsigned long)stx->stx_size - in->size, perms, false))) {
     return -EDQUOT;
   }
 
@@ -9189,8 +9190,10 @@ int64_t Client::_write(Fh *f, int64_t offset, uint64_t size, const char *buf,
 
   // check quota
   uint64_t endoff = offset + size;
-  if (endoff > in->size && is_quota_bytes_exceeded(in, endoff - in->size,
-						   f->actor_perms)) {
+  if (endoff > in->size &&
+      (is_quota_bytes_exceeded(in, endoff - in->size, f->actor_perms) ||
+       is_user_quota_bytes_exceeded(in, endoff - in->size, f->actor_perms, false) ||
+       is_group_quota_bytes_exceeded(in, endoff - in->size, f->actor_perms, false))) {
     return -EDQUOT;
   }
 
@@ -9352,7 +9355,9 @@ success:
     in->size = totalwritten + offset;
     in->mark_caps_dirty(CEPH_CAP_FILE_WR);
 
-    if (is_quota_bytes_approaching(in, f->actor_perms)) {
+    if (is_quota_bytes_approaching(in, f->actor_perms) ||
+        is_user_quota_bytes_approaching(in, f->actor_perms, false) ||
+        is_group_quota_bytes_approaching(in, f->actor_perms, false)) {
       check_caps(in, CHECK_CAPS_NODELAY);
     } else if (is_max_size_approaching(in)) {
       check_caps(in, 0);
@@ -10947,18 +10952,34 @@ int Client::_getxattr(Inode *in, const char *name, void *value, size_t size,
     }
 
     // call pointer-to-member function
+    const char *tmp = strchr(name,'@');
     char buf[256];
-    if (!(vxattr->exists_cb && !(this->*(vxattr->exists_cb))(in))) {
-      r = (this->*(vxattr->getxattr_cb))(in, buf, sizeof(buf));
+    if (!strncmp(name, "ceph.user_quota", 15) && tmp){
+      const char *user_name = tmp+1;
+      if (!(vxattr->exists_cb && !(this->*(vxattr->exists_cb))(in, user_name))) {
+        r = (this->*(vxattr->getxattr_cb))(in, buf, sizeof(buf), user_name);
+      } else {
+        r = -ENODATA;
+      }
+    } else if(!strncmp(name, "ceph.group_quota", 16) && tmp){
+      const char* group_name = tmp+1;
+      if (!(vxattr->exists_cb && !(this->*(vxattr->exists_cb))(in, group_name))) {
+        r = (this->*(vxattr->getxattr_cb))(in, buf, sizeof(buf), group_name);
+      } else {
+        r = -ENODATA;
+      }
     } else {
-      r = -ENODATA;
+      if (!(vxattr->exists_cb && !(this->*(vxattr->exists_cb))(in, NULL))) {
+        r = (this->*(vxattr->getxattr_cb))(in, buf, sizeof(buf), NULL);
+      } else {
+        r = -ENODATA;
+      }
     }
-
     if (size != 0) {
       if (r > (int)size) {
-	r = -ERANGE;
+        r = -ERANGE;
       } else if (r > 0) {
-	memcpy(value, buf, r);
+        memcpy(value, buf, r);
       }
     }
     goto out;
@@ -10976,10 +10997,10 @@ int Client::_getxattr(Inode *in, const char *name, void *value, size_t size,
    if (in->xattrs.count(n)) {
       r = in->xattrs[n].length();
       if (r > 0 && size != 0) {
-	if (size >= (unsigned)r)
-	  memcpy(value, in->xattrs[n].c_str(), r);
-	else
-	  r = -ERANGE;
+        if (size >= (unsigned)r)
+          memcpy(value, in->xattrs[n].c_str(), r);
+        else
+          r = -ERANGE;
       }
     }
   }
@@ -11054,7 +11075,7 @@ int Client::_listxattr(Inode *in, char *name, size_t size,
 	    if (vxattr.hidden)
 	      continue;
 	    // call pointer-to-member function
-	    if(vxattr.exists_cb && !(this->*(vxattr.exists_cb))(in))
+	    if(vxattr.exists_cb && !(this->*(vxattr.exists_cb))(in, NULL))
 	      continue;
 	    memcpy(name, vxattr.name.c_str(), vxattr.name.length());
 	    name += vxattr.name.length();
@@ -11145,32 +11166,32 @@ int Client::_setxattr(Inode *in, const char *name, const void *value,
     if (!strcmp(name, ACL_EA_ACCESS)) {
       mode_t new_mode = in->mode;
       if (value) {
-	int ret = posix_acl_equiv_mode(value, size, &new_mode);
-	if (ret < 0)
-	  return ret;
-	if (ret == 0) {
-	  value = NULL;
-	  size = 0;
-	}
-	if (new_mode != in->mode) {
-	  struct ceph_statx stx;
-	  stx.stx_mode = new_mode;
-	  ret = _do_setattr(in, &stx, CEPH_SETATTR_MODE, perms, NULL);
-	  if (ret < 0)
-	    return ret;
-	}
+        int ret = posix_acl_equiv_mode(value, size, &new_mode);
+        if (ret < 0)
+          return ret;
+        if (ret == 0) {
+          value = NULL;
+          size = 0;
+        }
+        if (new_mode != in->mode) {
+          struct ceph_statx stx;
+          stx.stx_mode = new_mode;
+          ret = _do_setattr(in, &stx, CEPH_SETATTR_MODE, perms, NULL);
+          if (ret < 0)
+            return ret;
+        }
       }
     } else if (!strcmp(name, ACL_EA_DEFAULT)) {
       if (value) {
-	if (!S_ISDIR(in->mode))
-	  return -EACCES;
-	int ret = posix_acl_check(value, size);
-	if (ret < 0)
-	  return -EINVAL;
-	if (ret == 0) {
-	  value = NULL;
-	  size = 0;
-	}
+        if (!S_ISDIR(in->mode))
+          return -EACCES;
+        int ret = posix_acl_check(value, size);
+        if (ret < 0)
+          return -EINVAL;
+        if (ret == 0) {
+          value = NULL;
+          size = 0;
+        }
       }
     } else {
       return -EOPNOTSUPP;
@@ -11179,16 +11200,44 @@ int Client::_setxattr(Inode *in, const char *name, const void *value,
     const VXattr *vxattr = _match_vxattr(in, name);
     if (vxattr) {
       if (vxattr->readonly)
-	return -EOPNOTSUPP;
-      if (vxattr->name.compare(0, 10, "ceph.quota") == 0 && value)
-	check_realm = true;
+        return -EOPNOTSUPP;
+      if ((vxattr->name.compare(0, 10, "ceph.quota") == 0 ||
+          vxattr->name.compare(0, 15, "ceph.user_quota") == 0 ||
+          vxattr->name.compare(0, 16, "ceph.group_quota") == 0) && value)
+        check_realm = true;
+
+      string sname(name);
+      if(sname.find("@") != sname.npos){
+        char buf[256];
+        string sub_name = sname.substr(0, sname.find("@"));
+        if (sub_name == "ceph.user_quota.max_bytes") {
+          string cp = sname.substr(sname.find("@")+1);
+          struct passwd *pw = getpwnam(cp.c_str());
+          if(!pw)
+            return -EINVAL;
+          uid_t uid = pw->pw_uid;
+          snprintf(buf, sizeof(buf),"%s@%lld", sub_name.c_str(), (long long int)uid);
+        } else if(sub_name == "ceph.group_quota.max_bytes") {
+          string cp = sname.substr(sname.find("@")+1);
+          struct group *data = getgrnam(cp.c_str());
+          if(!data)
+            return -EINVAL;
+          gid_t gid = data->gr_gid;
+          snprintf(buf, sizeof(buf),"%s@%lld", sub_name.c_str(), (long long int)gid);
+        } else {
+          return -EINVAL;
+        }
+        name = buf;
+      }
     }
   }
 
   int ret = _do_setxattr(in, name, value, size, flags, perms);
   if (ret >= 0 && check_realm) {
     // check if snaprealm was created for quota inode
-    if (in->quota.is_enable() &&
+    if ((in->quota.is_enable() ||
+      in->quota.is_user_enable() ||
+      in->quota.is_group_enable()) &&
 	!(in->snaprealm && in->snaprealm->ino == in->ino))
       ret = -EOPNOTSUPP;
   }
@@ -11362,32 +11411,160 @@ int Client::ll_removexattr(Inode *in, const char *name, const UserPerm& perms)
   return _removexattr(in, name, perms);
 }
 
-bool Client::_vxattrcb_quota_exists(Inode *in)
+bool Client::_vxattrcb_quota_exists(Inode *in, const char *name)
 {
   return in->quota.is_enable() &&
 	 in->snaprealm && in->snaprealm->ino == in->ino;
 }
-size_t Client::_vxattrcb_quota(Inode *in, char *val, size_t size)
+size_t Client::_vxattrcb_quota(Inode *in, char *val, size_t size, const char *name)
 {
   return snprintf(val, size,
                   "max_bytes=%lld max_files=%lld",
                   (long long int)in->quota.max_bytes,
                   (long long int)in->quota.max_files);
 }
-size_t Client::_vxattrcb_quota_max_bytes(Inode *in, char *val, size_t size)
+size_t Client::_vxattrcb_quota_max_bytes(Inode *in, char *val, size_t size, const char *name)
 {
   return snprintf(val, size, "%lld", (long long int)in->quota.max_bytes);
 }
-size_t Client::_vxattrcb_quota_max_files(Inode *in, char *val, size_t size)
+size_t Client::_vxattrcb_quota_max_files(Inode *in, char *val, size_t size, const char *name)
 {
   return snprintf(val, size, "%lld", (long long int)in->quota.max_files);
 }
 
-bool Client::_vxattrcb_layout_exists(Inode *in)
+bool Client::_vxattrcb_user_quota_exists(Inode *in, const char *name)
+{
+  if (name) {
+    struct passwd *pw = getpwnam(name);
+    if (!pw)
+      return -ENODATA;
+    return in->quota.is_user_enable(pw->pw_uid) &&
+      in->snaprealm && in->snaprealm->ino == in->ino;
+  } else {
+    return in->quota.is_user_enable() &&
+      in->snaprealm && in->snaprealm->ino == in->ino;
+  }
+}
+size_t Client::_vxattrcb_user_quota(Inode *in, char *val, size_t size, const char *name)
+{
+  if (name) {
+    struct passwd *pw = getpwnam(name);
+    if (!pw)
+      return -ENODATA;
+    int64_t user_max_bytes = in->quota.user_max_bytes[pw->pw_uid];
+    int64_t user_rbytes = in->rstat.user_rbytes.count(pw->pw_uid)? in->rstat.user_rbytes[pw->pw_uid] : 0;
+    return snprintf(val, size, "%lld used_bytes:%lld", (long long int)user_max_bytes, (long long int)user_rbytes);
+  } else {
+    size_t r=0;
+    for (auto& p : in->quota.user_max_bytes){
+      if(p.second > 0){
+        char buf[256];
+        int64_t user_rbytes = in->rstat.user_rbytes.count(p.first)? in->rstat.user_rbytes[p.first] : 0;
+        size_t len = snprintf(buf, sizeof(buf), "user_id:%lld max_bytes:%lld used_bytes:%lld ",
+           (long long int)p.first, (long long int)p.second, (long long int)user_rbytes);
+        if(len > (size - r))
+          break;
+        r += snprintf(val + r, size - r, "%s", buf);
+      }
+    }
+    return r;
+  }
+}
+size_t Client::_vxattrcb_user_quota_max_bytes(Inode *in, char *val, size_t size, const char *name)
+{
+  if (name) {
+    struct passwd *pw = getpwnam(name);
+    if (!pw)
+      return -ENODATA;
+    int64_t user_max_bytes = in->quota.user_max_bytes[pw->pw_uid];
+    int64_t user_rbytes = in->rstat.user_rbytes.count(pw->pw_uid)? in->rstat.user_rbytes[pw->pw_uid] : 0;
+    return snprintf(val, size, "%lld used_bytes:%lld", (long long int)user_max_bytes, (long long int)user_rbytes);
+  } else {
+    size_t r=0;
+    for (auto& p : in->quota.user_max_bytes){
+      if(p.second > 0){
+        char buf[256];
+        int64_t user_rbytes = in->rstat.user_rbytes.count(p.first)? in->rstat.user_rbytes[p.first] : 0;
+        size_t len = snprintf(buf, sizeof(buf), "user_id:%lld max_bytes:%lld used_bytes:%lld ",
+            (long long int)p.first, (long long int)p.second, (long long int)user_rbytes);
+        if(len > (size - r))
+          break;
+        r += snprintf(val + r, size - r, "%s", buf);
+      }
+    }
+    return r;
+  }
+}
+
+bool Client::_vxattrcb_group_quota_exists(Inode *in, const char *name)
+{
+  if (name){
+    struct group * data = getgrnam(name);
+    if (!data)
+      return -ENODATA;
+    return in->quota.is_group_enable(data->gr_gid) &&
+      in->snaprealm && in->snaprealm->ino == in->ino;
+  } else {
+    return in->quota.is_group_enable() &&
+      in->snaprealm && in->snaprealm->ino == in->ino;
+  }
+}
+size_t Client::_vxattrcb_group_quota(Inode *in, char *val, size_t size, const char *name)
+{
+  if (name) {
+    struct group * data = getgrnam(name);
+    if (!data)
+      return -ENODATA;
+    int64_t group_max_bytes = in->quota.group_max_bytes[data->gr_gid];
+    int64_t group_rbytes = in->rstat.group_rbytes.count(data->gr_gid)? in->rstat.group_rbytes[data->gr_gid] : 0;
+    return snprintf(val, size, "%lld used_bytes:%lld", (long long int)group_max_bytes, (long long int)group_rbytes);
+  } else {
+    size_t r=0;
+    for (auto& p : in->quota.group_max_bytes){
+      if(p.second > 0){
+        char buf[256];
+        int64_t group_rbytes = in->rstat.group_rbytes.count(p.first)? in->rstat.group_rbytes[p.first] : 0;
+        size_t len = snprintf(buf, sizeof(buf), "group_id:%lld max_bytes:%lld used_bytes:%lld ",
+          (long long int)p.first, (long long int)p.second, (long long int)group_rbytes);
+        if(len > (size - r))
+          break;
+        r += snprintf(val + r, size - r, "%s", buf);
+      }
+    }
+    return r;
+  }
+}
+size_t Client::_vxattrcb_group_quota_max_bytes(Inode *in, char *val, size_t size, const char *name)
+{
+  if (name) {
+    struct group * data = getgrnam(name);
+    if (!data)
+      return -ENODATA;
+    int64_t group_max_bytes = in->quota.group_max_bytes[data->gr_gid];
+    int64_t group_rbytes = in->rstat.group_rbytes.count(data->gr_gid)? in->rstat.group_rbytes[data->gr_gid] : 0;
+    return snprintf(val, size, "%lld used_bytes:%lld", (long long int)group_max_bytes, (long long int)group_rbytes);
+  } else {
+    size_t r=0;
+    for (auto& p : in->quota.group_max_bytes){
+      if(p.second > 0){
+        char buf[256];
+        int64_t group_rbytes = in->rstat.group_rbytes.count(p.first)? in->rstat.group_rbytes[p.first] : 0;
+        size_t len = snprintf(buf, sizeof(buf), "group_id:%lld max_bytes:%lld used_bytes:%lld ",
+            (long long int)p.first, (long long int)p.second, (long long int)group_rbytes);
+        if(len > (size - r))
+          break;
+        r += snprintf(val + r, size - r, "%s", buf);
+      }
+    }
+    return r;
+  }
+}
+
+bool Client::_vxattrcb_layout_exists(Inode *in, const char *name)
 {
   return in->layout != file_layout_t();
 }
-size_t Client::_vxattrcb_layout(Inode *in, char *val, size_t size)
+size_t Client::_vxattrcb_layout(Inode *in, char *val, size_t size, const char *name)
 {
   int r = snprintf(val, size,
       "stripe_unit=%llu stripe_count=%llu object_size=%llu pool=",
@@ -11407,19 +11584,19 @@ size_t Client::_vxattrcb_layout(Inode *in, char *val, size_t size)
 		  in->layout.pool_ns.c_str());
   return r;
 }
-size_t Client::_vxattrcb_layout_stripe_unit(Inode *in, char *val, size_t size)
+size_t Client::_vxattrcb_layout_stripe_unit(Inode *in, char *val, size_t size, const char *name)
 {
   return snprintf(val, size, "%llu", (unsigned long long)in->layout.stripe_unit);
 }
-size_t Client::_vxattrcb_layout_stripe_count(Inode *in, char *val, size_t size)
+size_t Client::_vxattrcb_layout_stripe_count(Inode *in, char *val, size_t size, const char *name)
 {
   return snprintf(val, size, "%llu", (unsigned long long)in->layout.stripe_count);
 }
-size_t Client::_vxattrcb_layout_object_size(Inode *in, char *val, size_t size)
+size_t Client::_vxattrcb_layout_object_size(Inode *in, char *val, size_t size, const char *name)
 {
   return snprintf(val, size, "%llu", (unsigned long long)in->layout.object_size);
 }
-size_t Client::_vxattrcb_layout_pool(Inode *in, char *val, size_t size)
+size_t Client::_vxattrcb_layout_pool(Inode *in, char *val, size_t size, const char *name)
 {
   size_t r;
   objecter->with_osdmap([&](const OSDMap& o) {
@@ -11431,39 +11608,54 @@ size_t Client::_vxattrcb_layout_pool(Inode *in, char *val, size_t size)
     });
   return r;
 }
-size_t Client::_vxattrcb_layout_pool_namespace(Inode *in, char *val, size_t size)
+size_t Client::_vxattrcb_layout_pool_namespace(Inode *in, char *val, size_t size, const char *name)
 {
   return snprintf(val, size, "%s", in->layout.pool_ns.c_str());
 }
-size_t Client::_vxattrcb_dir_entries(Inode *in, char *val, size_t size)
+size_t Client::_vxattrcb_dir_entries(Inode *in, char *val, size_t size, const char *name)
 {
   return snprintf(val, size, "%llu", (unsigned long long)(in->dirstat.nfiles + in->dirstat.nsubdirs));
 }
-size_t Client::_vxattrcb_dir_files(Inode *in, char *val, size_t size)
+size_t Client::_vxattrcb_dir_files(Inode *in, char *val, size_t size, const char *name)
 {
   return snprintf(val, size, "%llu", (unsigned long long)in->dirstat.nfiles);
 }
-size_t Client::_vxattrcb_dir_subdirs(Inode *in, char *val, size_t size)
+size_t Client::_vxattrcb_dir_subdirs(Inode *in, char *val, size_t size, const char *name)
 {
   return snprintf(val, size, "%llu", (unsigned long long)in->dirstat.nsubdirs);
 }
-size_t Client::_vxattrcb_dir_rentries(Inode *in, char *val, size_t size)
+size_t Client::_vxattrcb_dir_rentries(Inode *in, char *val, size_t size, const char *name)
 {
   return snprintf(val, size, "%llu", (unsigned long long)(in->rstat.rfiles + in->rstat.rsubdirs));
 }
-size_t Client::_vxattrcb_dir_rfiles(Inode *in, char *val, size_t size)
+size_t Client::_vxattrcb_dir_rfiles(Inode *in, char *val, size_t size, const char *name)
 {
   return snprintf(val, size, "%llu", (unsigned long long)in->rstat.rfiles);
 }
-size_t Client::_vxattrcb_dir_rsubdirs(Inode *in, char *val, size_t size)
+size_t Client::_vxattrcb_dir_rsubdirs(Inode *in, char *val, size_t size, const char *name)
 {
   return snprintf(val, size, "%llu", (unsigned long long)in->rstat.rsubdirs);
 }
-size_t Client::_vxattrcb_dir_rbytes(Inode *in, char *val, size_t size)
+size_t Client::_vxattrcb_dir_rbytes(Inode *in, char *val, size_t size, const char *name)
 {
   return snprintf(val, size, "%llu", (unsigned long long)in->rstat.rbytes);
 }
-size_t Client::_vxattrcb_dir_rctime(Inode *in, char *val, size_t size)
+size_t Client::_vxattrcb_dir_user_rbytes(Inode *in, char *val, size_t size, const char *name)
+{
+  size_t r = 0;
+  for (auto& p : in->rstat.user_rbytes)
+    r += snprintf(val, size, "id:%llu rbytes:%llu ", (unsigned long long)p.first, (unsigned long long)p.second);
+  return r;
+}
+size_t Client::_vxattrcb_dir_group_rbytes(Inode *in, char *val, size_t size, const char *name)
+{
+  size_t r = 0;
+  for (auto& p : in->rstat.group_rbytes)
+    r += snprintf(val, size, "id:%llu rbytes:%llu ", (unsigned long long)p.first, (unsigned long long)p.second);
+  return r;
+}
+
+size_t Client::_vxattrcb_dir_rctime(Inode *in, char *val, size_t size, const char *name)
 {
   return snprintf(val, size, "%ld.09%ld", (long)in->rstat.rctime.sec(),
       (long)in->rstat.rctime.nsec());
@@ -11508,6 +11700,24 @@ size_t Client::_vxattrcb_dir_rctime(Inode *in, char *val, size_t size)
   exists_cb: &Client::_vxattrcb_quota_exists,			\
   flags: 0,                                                     \
 }
+#define XATTR_USER_QUOTA_FIELD(_type, _name)		                \
+{								\
+  name: CEPH_XATTR_NAME(_type, _name),			        \
+  getxattr_cb: &Client::_vxattrcb_ ## _type ## _ ## _name,	\
+  readonly: false,						\
+  hidden: true,							\
+  exists_cb: &Client::_vxattrcb_user_quota_exists,			\
+  flags: 0,                                                     \
+}
+#define XATTR_GROUP_QUOTA_FIELD(_type, _name)		                \
+{								\
+  name: CEPH_XATTR_NAME(_type, _name),			        \
+  getxattr_cb: &Client::_vxattrcb_ ## _type ## _ ## _name,	\
+  readonly: false,						\
+  hidden: true,							\
+  exists_cb: &Client::_vxattrcb_group_quota_exists,			\
+  flags: 0,                                                     \
+}
 
 const Client::VXattr Client::_dir_vxattrs[] = {
   {
@@ -11531,6 +11741,8 @@ const Client::VXattr Client::_dir_vxattrs[] = {
   XATTR_NAME_CEPH2(dir, rsubdirs, VXATTR_RSTAT),
   XATTR_NAME_CEPH2(dir, rbytes, VXATTR_RSTAT),
   XATTR_NAME_CEPH2(dir, rctime, VXATTR_RSTAT),
+  XATTR_NAME_CEPH2(dir, user_rbytes, VXATTR_RSTAT),
+  XATTR_NAME_CEPH2(dir, group_rbytes, VXATTR_RSTAT),
   {
     name: "ceph.quota",
     getxattr_cb: &Client::_vxattrcb_quota,
@@ -11541,6 +11753,26 @@ const Client::VXattr Client::_dir_vxattrs[] = {
   },
   XATTR_QUOTA_FIELD(quota, max_bytes),
   XATTR_QUOTA_FIELD(quota, max_files),
+  {
+    name: "ceph.user_quota",
+    getxattr_cb: &Client::_vxattrcb_user_quota,
+    readonly: false,
+    hidden: true,
+    exists_cb: &Client::_vxattrcb_user_quota_exists,
+    flags: 0,
+  },
+  XATTR_USER_QUOTA_FIELD(user_quota, max_bytes),
+  {
+    name: "ceph.group_quota",
+    getxattr_cb: &Client::_vxattrcb_group_quota,
+    readonly: false,
+    hidden: true,
+    exists_cb: &Client::_vxattrcb_group_quota_exists,
+    flags: 0,
+  },
+  XATTR_GROUP_QUOTA_FIELD(group_quota, max_bytes),
+  /* end */
+
   { name: "" }     /* Required table terminator */
 };
 
@@ -11572,13 +11804,19 @@ const Client::VXattr *Client::_get_vxattrs(Inode *in)
 
 const Client::VXattr *Client::_match_vxattr(Inode *in, const char *name)
 {
+  string sub_name;
+  string sname(name);
+  if(sname.find("@") != sname.npos)
+    sub_name = sname.substr(0, sname.find("@"));
+  else
+    sub_name = name;
   if (strncmp(name, "ceph.", 5) == 0) {
     const VXattr *vxattr = _get_vxattrs(in);
     if (vxattr) {
       while (!vxattr->name.empty()) {
-	if (vxattr->name == name)
-	  return vxattr;
-	vxattr++;
+        if (vxattr->name == sub_name)
+          return vxattr;
+        vxattr++;
       }
     }
   }
@@ -12277,6 +12515,22 @@ int Client::_rename(Inode *fromdir, const char *fromname, Inode *todir, const ch
       fromdir->quota.is_enable() ? fromdir : get_quota_root(fromdir, perm);
     Inode *todir_root =
       todir->quota.is_enable() ? todir : get_quota_root(todir, perm);
+    if (fromdir_root != todir_root) {
+      return -EXDEV;
+    }
+
+    fromdir_root =
+      fromdir->quota.is_user_enable()? fromdir : get_user_quota_root(fromdir);
+    todir_root =
+      todir->quota.is_user_enable()? todir : get_user_quota_root(todir);
+    if (fromdir_root != todir_root) {
+      return -EXDEV;
+    }
+
+    fromdir_root =
+      fromdir->quota.is_group_enable()? fromdir : get_group_quota_root(fromdir);
+    todir_root =
+      todir->quota.is_group_enable()? todir : get_group_quota_root(todir);
     if (fromdir_root != todir_root) {
       return -EXDEV;
     }
@@ -13080,7 +13334,9 @@ int Client::_fallocate(Fh *fh, int mode, int64_t offset, int64_t length)
   uint64_t size = offset + length;
   if (!(mode & (FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE)) &&
       size > in->size &&
-      is_quota_bytes_exceeded(in, size - in->size, fh->actor_perms)) {
+      (is_quota_bytes_exceeded(in, size - in->size, fh->actor_perms) ||
+       is_user_quota_bytes_exceeded(in, size - in->size, fh->actor_perms, false) ||
+       is_group_quota_bytes_exceeded(in, size - in->size, fh->actor_perms, false))) {
     return -EDQUOT;
   }
 
@@ -13145,10 +13401,12 @@ int Client::_fallocate(Fh *fh, int mode, int64_t offset, int64_t length)
       in->change_attr++;
       in->mark_caps_dirty(CEPH_CAP_FILE_WR);
 
-      if (is_quota_bytes_approaching(in, fh->actor_perms)) {
+      if (is_quota_bytes_approaching(in, fh->actor_perms) ||
+          is_user_quota_bytes_approaching(in, fh->actor_perms, false) ||
+          is_group_quota_bytes_approaching(in, fh->actor_perms, false)) {
         check_caps(in, CHECK_CAPS_NODELAY);
       } else if (is_max_size_approaching(in)) {
-	check_caps(in, 0);
+        check_caps(in, 0);
       }
     }
   }
@@ -13747,6 +14005,213 @@ bool Client::is_quota_bytes_approaching(Inode *in, const UserPerm& perms)
         }
       });
 }
+
+Inode *Client::get_user_quota_root(Inode *in)
+{
+  Inode *quota_in = root_ancestor;
+  SnapRealm *realm = in->snaprealm;
+  while (realm) {
+    ldout(cct, 10) << __func__ << " realm " << realm->ino << dendl;
+    if (realm->ino != in->ino) {
+      auto p = inode_map.find(vinodeno_t(realm->ino, CEPH_NOSNAP));
+      if (p == inode_map.end())
+        break;
+
+      if (p->second->quota.is_user_enable()) {
+        quota_in = p->second;
+        break;
+      }
+    }
+    realm = realm->pparent;
+  }
+  ldout(cct, 10) << __func__ << " " << in->vino() << " -> " << quota_in->vino() << dendl;
+  return quota_in;
+}
+
+Inode *Client::get_user_quota_root(Inode *in, uid_t uid)
+{
+  Inode *quota_in = root_ancestor;
+  SnapRealm *realm = in->snaprealm;
+  while (realm) {
+    ldout(cct, 10) << __func__ << " realm " << realm->ino << dendl;
+    if (realm->ino != in->ino) {
+      auto p = inode_map.find(vinodeno_t(realm->ino, CEPH_NOSNAP));
+      if (p == inode_map.end())
+        break;
+
+      if (p->second->quota.is_user_enable(uid)) {
+        quota_in = p->second;
+        break;
+      }
+    }
+    realm = realm->pparent;
+  }
+  ldout(cct, 10) << __func__ << " " << in->vino() << " -> " << quota_in->vino() << dendl;
+  return quota_in;
+}
+
+/**
+ * Traverse user quota ancestors of the Inode, return true
+ * if any of them passes the passed function
+ */
+bool Client::check_user_quota_condition(Inode *in, uid_t uid,
+				   std::function<bool (Inode &in)> test)
+{
+  while (true) {
+    assert(in != NULL);
+    if (test(*in)) {
+      return true;
+    }
+
+    if (in == root_ancestor) {
+      // We're done traversing, drop out
+      return false;
+    } else {
+      // Continue up the tree
+      in = get_user_quota_root(in, uid);
+    }
+  }
+  return false;
+}
+
+bool Client::is_user_quota_bytes_exceeded(Inode *in, int64_t new_bytes,
+    const UserPerm& perms, bool flag)
+{
+  uid_t tmp_uid = flag? perms.uid() : in->uid;
+
+  return check_user_quota_condition(in, tmp_uid,
+      [&new_bytes, &tmp_uid](Inode &in) {
+      int64_t user_maxbytes = in.quota.user_max_bytes.count(tmp_uid)? in.quota.user_max_bytes[tmp_uid] : 0;
+      int64_t user_rbytes = in.rstat.user_rbytes.count(tmp_uid)? in.rstat.user_rbytes[tmp_uid] : 0;
+        return (user_maxbytes > 0 && (user_rbytes + new_bytes) > user_maxbytes);
+      });
+}
+
+bool Client::is_user_quota_bytes_approaching(Inode *in, const UserPerm& perms, bool flag)
+{
+  uid_t tmp_uid = flag? perms.uid() : in->uid;
+  return check_user_quota_condition(in, tmp_uid,
+      [&tmp_uid](Inode &in) {
+        int64_t user_maxbytes = in.quota.user_max_bytes.count(tmp_uid)? in.quota.user_max_bytes[tmp_uid] : 0;
+        int64_t user_rbytes = in.rstat.user_rbytes.count(tmp_uid)? in.rstat.user_rbytes[tmp_uid] : 0;
+
+        if (user_maxbytes) {
+          if (user_rbytes >= user_maxbytes) {
+            return true;
+          }
+          assert(in.size >= in.reported_size);
+          uint64_t user_space = user_maxbytes - user_rbytes;
+          uint64_t size = in.size - in.reported_size;
+          if((user_space>> 4) < size)
+            return true;
+        }
+        return false;
+      });
+}
+
+Inode *Client::get_group_quota_root(Inode *in)
+{
+  Inode *quota_in = root_ancestor;
+  SnapRealm *realm = in->snaprealm;
+  while (realm) {
+    ldout(cct, 10) << __func__ << " realm " << realm->ino << dendl;
+    if (realm->ino != in->ino) {
+      auto p = inode_map.find(vinodeno_t(realm->ino, CEPH_NOSNAP));
+      if (p == inode_map.end())
+        break;
+
+      if (p->second->quota.is_group_enable()) {
+        quota_in = p->second;
+        break;
+      }
+    }
+    realm = realm->pparent;
+  }
+  ldout(cct, 10) << __func__ << " " << in->vino() << " -> " << quota_in->vino() << dendl;
+  return quota_in;
+}
+
+Inode *Client::get_group_quota_root(Inode *in, gid_t gid)
+{
+  Inode *quota_in = root_ancestor;
+  SnapRealm *realm = in->snaprealm;
+  while (realm) {
+    ldout(cct, 10) << __func__ << " realm " << realm->ino << dendl;
+    if (realm->ino != in->ino) {
+      auto p = inode_map.find(vinodeno_t(realm->ino, CEPH_NOSNAP));
+      if (p == inode_map.end())
+	      break;
+
+      if (p->second->quota.is_group_enable(gid)) {
+	      quota_in = p->second;
+	      break;
+      }
+    }
+    realm = realm->pparent;
+  }
+  ldout(cct, 10) << __func__ << " " << in->vino() << " -> " << quota_in->vino() << dendl;
+  return quota_in;
+}
+
+/**
+ * Traverse group quota ancestors of the Inode, return true
+ * if any of them passes the passed function
+ */
+bool Client::check_group_quota_condition(Inode *in, gid_t gid,
+				   std::function<bool (Inode &in)> test)
+{
+  while (true) {
+    assert(in != NULL);
+    if (test(*in)) {
+      return true;
+    }
+
+    if (in == root_ancestor) {
+      // We're done traversing, drop out
+      return false;
+    } else {
+      // Continue up the tree
+      in = get_group_quota_root(in, gid);
+    }
+  }
+  return false;
+}
+
+bool Client::is_group_quota_bytes_exceeded(Inode *in, int64_t new_bytes,
+    const UserPerm& perms, bool flag)
+{
+  gid_t tmp_gid = flag? perms.gid() : in->gid;
+
+  return check_group_quota_condition(in, tmp_gid,
+      [&new_bytes,  &tmp_gid](Inode &in) {
+      int64_t group_maxbytes = in.quota.group_max_bytes.count(tmp_gid)? in.quota.group_max_bytes[tmp_gid] : 0;
+      int64_t group_rbytes = in.rstat.group_rbytes.count(tmp_gid)? in.rstat.group_rbytes[tmp_gid] : 0;
+        return (group_maxbytes > 0 && (group_rbytes + new_bytes) > group_maxbytes);
+      });
+}
+
+bool Client::is_group_quota_bytes_approaching(Inode *in, const UserPerm& perms, bool flag)
+{
+  gid_t tmp_gid = flag? perms.gid() : in->gid;
+  return check_group_quota_condition(in, tmp_gid,
+      [&tmp_gid](Inode &in) {
+        int64_t group_maxbytes = in.quota.group_max_bytes.count(tmp_gid)? in.quota.group_max_bytes[tmp_gid] : 0;
+        int64_t group_rbytes = in.rstat.group_rbytes.count(tmp_gid)? in.rstat.group_rbytes[tmp_gid] : 0;
+
+        if (group_maxbytes) {
+          if (group_rbytes >= group_maxbytes) {
+            return true;
+          }
+          assert(in.size >= in.reported_size);
+          uint64_t group_space = group_maxbytes - group_rbytes;
+          uint64_t size = in.size - in.reported_size;
+          if((group_space>> 4) < size)
+            return true;
+        }
+        return false;
+      });
+}
+
 
 enum {
   POOL_CHECKED = 1,

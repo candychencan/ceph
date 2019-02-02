@@ -325,6 +325,8 @@ public:
   version_t client_inline_version;
   int64_t last_rbytes;
   int64_t last_rsize;
+  std::map<uid_t, int64_t> last_user_rbytes;
+  std::map<gid_t, int64_t> last_group_rbytes;
 
   xlist<Capability*>::item item_session_caps;
   xlist<Capability*>::item item_snaprealm_caps;

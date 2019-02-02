@@ -2034,12 +2034,16 @@ void MDCache::broadcast_quota_to_client(CInode *in, client_t exclude_ct)
     return;
 
   auto i = in->get_projected_inode();
-  if (!i->quota.is_enable())
+  if (!i->quota.is_enable() && !i->quota.is_user_enable() && !i->quota.is_group_enable())
     return;
 
   // creaete snaprealm for quota inode (quota was set before mimic)
-  if (!in->get_projected_srnode())
+  if (!in->get_projected_srnode() && i->quota.is_enable())
     mds->server->create_quota_realm(in);
+  if (!in->get_projected_srnode() && i->quota.is_user_enable())
+    mds->server->create_user_quota_realm(in);
+  if (!in->get_projected_srnode() && i->quota.is_group_enable())
+    mds->server->create_group_quota_realm(in);
 
   for (map<client_t,Capability*>::iterator it = in->client_caps.begin();
        it != in->client_caps.end();
@@ -2055,9 +2059,12 @@ void MDCache::broadcast_quota_to_client(CInode *in, client_t exclude_ct)
       goto update;
 
     if (cap->last_rbytes == i->rstat.rbytes &&
-        cap->last_rsize == i->rstat.rsize())
+        cap->last_rsize == i->rstat.rsize() &&
+        cap->last_user_rbytes == i->rstat.user_rbytes &&
+        cap->last_group_rbytes == i->rstat.group_rbytes)
       continue;
 
+    //quota
     if (i->quota.max_files > 0) {
       if (i->rstat.rsize() >= i->quota.max_files)
         goto update;
@@ -2076,11 +2083,47 @@ void MDCache::broadcast_quota_to_client(CInode *in, client_t exclude_ct)
         goto update;
     }
 
+    //user quota
+    for (auto& p : i->quota.user_max_bytes) {
+      if (p.second > 0) {
+        auto riter = i->rstat.user_rbytes.find(p.first);
+        auto citer = cap->last_user_rbytes.find(p.first);
+        int64_t user_rbytes = riter != i->rstat.user_rbytes.end()? riter->second : 0;
+        int64_t last_user_rbytes = citer != cap->last_user_rbytes.end()? citer->second : 0;
+
+        if (user_rbytes > p.second - (p.second >> 3))
+          goto update;
+
+        if ((abs(last_user_rbytes - p.second) >> 4) <
+          abs(last_user_rbytes - user_rbytes))
+          goto update;
+      }
+    }
+
+    //group quota
+    for (auto& p : i->quota.group_max_bytes) {
+      if (p.second > 0) {
+        auto riter = i->rstat.group_rbytes.find(p.first);
+        auto citer = cap->last_group_rbytes.find(p.first);
+        int64_t group_rbytes = riter != i->rstat.group_rbytes.end()? riter->second : 0;
+        int64_t last_group_rbytes = citer != cap->last_group_rbytes.end()? citer->second : 0;
+
+        if (group_rbytes > p.second - (p.second >> 3))
+          goto update;
+
+        if ((abs(last_group_rbytes - p.second) >> 4) <
+          abs(last_group_rbytes - group_rbytes))
+          goto update;
+      }
+    }
+
     continue;
 
 update:
     cap->last_rsize = i->rstat.rsize();
     cap->last_rbytes = i->rstat.rbytes;
+    cap->last_user_rbytes = i->rstat.user_rbytes;
+    cap->last_group_rbytes = i->rstat.group_rbytes;
 
     MClientQuota *msg = new MClientQuota();
     msg->ino = in->ino();
@@ -2378,7 +2421,9 @@ void MDCache::predirty_journal_parents(MutationRef mut, EMetaBlob *blob,
     pf->accounted_rstat = pf->rstat;
 
     if (parent->get_frag() == frag_t()) { // i.e., we are the only frag
-      if (pi.inode.rstat.rbytes != pf->rstat.rbytes) {
+      if (pi.inode.rstat.rbytes != pf->rstat.rbytes ||
+        pi.inode.rstat.user_rbytes != pf->rstat.user_rbytes ||
+        pi.inode.rstat.group_rbytes != pf->rstat.group_rbytes) {
 	mds->clog->error() << "unmatched rstat rbytes on single dirfrag "
 	  << parent->dirfrag() << ", inode has " << pi.inode.rstat
 	  << ", dirfrag has " << pf->rstat;

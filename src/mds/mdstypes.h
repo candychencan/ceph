@@ -9,6 +9,7 @@
 #include <ostream>
 #include <set>
 #include <map>
+#include <unordered_map>
 #include <string_view>
 
 #include "common/config.h"
@@ -213,7 +214,11 @@ struct frag_info_t : public scatter_info_t {
 WRITE_CLASS_ENCODER(frag_info_t)
 
 inline bool operator==(const frag_info_t &l, const frag_info_t &r) {
-  return memcmp(&l, &r, sizeof(l)) == 0;
+  return l.version == r.version &&
+        l.mtime == r.mtime &&
+        l.change_attr == r.change_attr &&
+        l.nfiles == r.nfiles &&
+        l.nsubdirs == r.nsubdirs;
 }
 inline bool operator!=(const frag_info_t &l, const frag_info_t &r) {
   return !(l == r);
@@ -221,21 +226,94 @@ inline bool operator!=(const frag_info_t &l, const frag_info_t &r) {
 
 std::ostream& operator<<(std::ostream &out, const frag_info_t &f);
 
-
 struct nest_info_t : public scatter_info_t {
   // this frag + children
   utime_t rctime;
   int64_t rbytes = 0;
   int64_t rfiles = 0;
   int64_t rsubdirs = 0;
-  int64_t rsize() const { return rfiles + rsubdirs; }
-
   int64_t rsnaps = 0;
+  std::map<uid_t, int64_t> user_rbytes;
+  std::map<gid_t, int64_t> group_rbytes;
+
+  int64_t rsize() const { return rfiles + rsubdirs; }
 
   nest_info_t() {}
 
   void zero() {
     *this = nest_info_t();
+  }
+
+  void user_rbytes_sub(     std::map<uid_t, int64_t> other) {
+    user_rbytes_add(other, -1);
+  }
+  void user_rbytes_add(     std::map<uid_t, int64_t> other, int fac=1) {
+    for (auto& p : other) {
+      user_rbytes[p.first] += fac * p.second;
+      if (0 == user_rbytes[p.first])
+        user_rbytes.erase(p.first);
+    }
+  }
+
+  // *this += cur - acc;
+  void user_rbytes_add_delta(     std::map<uid_t, int64_t> cur,   std::map<uid_t, int64_t> acc) {
+    int64_t urbytes = 0;
+    auto tmp = acc;
+
+    for (auto& p : cur) {
+      auto iter = tmp.find(p.first);
+      if (iter != tmp.end()) {
+        urbytes = iter->second;
+        tmp.erase(iter);
+      } else {
+        urbytes = 0;
+      }
+
+      user_rbytes[p.first] += p.second - urbytes;
+      if (0 == user_rbytes[p.first])
+        user_rbytes.erase(p.first);
+    }
+
+    for (auto& p : tmp) {
+      user_rbytes[p.first] += 0 - p.second;
+      if (0 == user_rbytes[p.first])
+        user_rbytes.erase(p.first);
+    }
+  }
+  void group_rbytes_sub(     std::map<gid_t, int64_t> other) {
+    group_rbytes_add(other, -1);
+  }
+  void group_rbytes_add(     std::map<gid_t, int64_t> other, int fac=1) {
+    for (auto& p : other) {
+      group_rbytes[p.first] += fac * p.second;
+      if (0 == group_rbytes[p.first])
+        group_rbytes.erase(p.first);
+    }
+  }
+  // *this += cur - acc;
+  void group_rbytes_add_delta(     std::map<gid_t, int64_t> cur,    std::map<gid_t, int64_t> acc) {
+    int64_t grbytes = 0;
+    std::map<gid_t, int64_t> tmp = acc;
+
+    for (auto& p : cur) {
+      auto iter = tmp.find(p.first);
+      if (iter != tmp.end()) {
+        grbytes = iter->second;
+        tmp.erase(iter);
+      } else {
+        grbytes = 0;
+      }
+
+      group_rbytes[p.first] += p.second - grbytes;
+      if (0 == group_rbytes[p.first])
+        group_rbytes.erase(p.first);
+    }
+
+    for (auto& p : tmp) {
+      group_rbytes[p.first] += 0 - p.second;
+      if (0 == group_rbytes[p.first])
+        group_rbytes.erase(p.first);
+    }
   }
 
   void sub(const nest_info_t &other) {
@@ -248,6 +326,8 @@ struct nest_info_t : public scatter_info_t {
     rfiles += fac*other.rfiles;
     rsubdirs += fac*other.rsubdirs;
     rsnaps += fac*other.rsnaps;
+    user_rbytes_add(other.user_rbytes, fac);
+    group_rbytes_add(other.group_rbytes, fac);
   }
 
   // *this += cur - acc;
@@ -258,6 +338,8 @@ struct nest_info_t : public scatter_info_t {
     rfiles += cur.rfiles - acc.rfiles;
     rsubdirs += cur.rsubdirs - acc.rsubdirs;
     rsnaps += cur.rsnaps - acc.rsnaps;
+    user_rbytes_add_delta(cur.user_rbytes, acc.user_rbytes);
+    group_rbytes_add_delta(cur.group_rbytes, acc.group_rbytes);
   }
 
   bool same_sums(const nest_info_t &o) const {
@@ -265,7 +347,9 @@ struct nest_info_t : public scatter_info_t {
         rbytes == o.rbytes &&
         rfiles == o.rfiles &&
         rsubdirs == o.rsubdirs &&
-        rsnaps == o.rsnaps;
+        rsnaps == o.rsnaps &&
+        user_rbytes == o.user_rbytes &&
+        group_rbytes == o.group_rbytes;
   }
 
   void encode(bufferlist &bl) const;
@@ -276,7 +360,14 @@ struct nest_info_t : public scatter_info_t {
 WRITE_CLASS_ENCODER(nest_info_t)
 
 inline bool operator==(const nest_info_t &l, const nest_info_t &r) {
-  return memcmp(&l, &r, sizeof(l)) == 0;
+  return l.version == r.version &&
+        l.rctime == r.rctime &&
+        l.rbytes == r.rbytes &&
+        l.rfiles == r.rfiles &&
+        l.rsubdirs == r.rsubdirs &&
+        l.rsnaps == r.rsnaps &&
+        l.user_rbytes == r.user_rbytes &&
+        l.group_rbytes == r.group_rbytes;
 }
 inline bool operator!=(const nest_info_t &l, const nest_info_t &r) {
   return !(l == r);
@@ -320,19 +411,27 @@ struct quota_info_t
 {
   int64_t max_bytes = 0;
   int64_t max_files = 0;
- 
+  std::map<uid_t, int64_t> user_max_bytes;
+  std::map<gid_t, int64_t> group_max_bytes;
+
   quota_info_t() {}
 
   void encode(bufferlist& bl) const {
-    ENCODE_START(1, 1, bl);
+    ENCODE_START(2, 1, bl);
     encode(max_bytes, bl);
     encode(max_files, bl);
+    encode(user_max_bytes, bl);
+    encode(group_max_bytes, bl);
     ENCODE_FINISH(bl);
   }
   void decode(bufferlist::iterator& p) {
-    DECODE_START_LEGACY_COMPAT_LEN(1, 1, 1, p);
+    DECODE_START_LEGACY_COMPAT_LEN(2, 1, 1, p);
     decode(max_bytes, p);
     decode(max_files, p);
+    if (struct_v >= 2) {
+      decode(user_max_bytes, p);
+      decode(group_max_bytes, p);
+    }
     DECODE_FINISH(p);
   }
 
@@ -345,11 +444,48 @@ struct quota_info_t
   bool is_enable() const {
     return max_bytes || max_files;
   }
+  bool is_user_valid() const {
+    for (auto& p : user_max_bytes) {
+      if (p.second < 0)
+        return false;
+    }
+    return true;
+  }
+  bool is_user_valid(uid_t uid)     {
+    return user_max_bytes.count(uid)? user_max_bytes[uid] >= 0 : true;
+  }
+  bool is_user_enable() const {
+    return user_max_bytes.size() > 0;
+  }
+  bool is_user_enable(uid_t uid)      {
+    auto iter = user_max_bytes.find(uid);
+    return (iter != user_max_bytes.end())? iter->second > 0 : false;
+  }
+  bool is_group_valid() const {
+    for (auto& p : group_max_bytes) {
+      if (p.second < 0)
+        return false;
+    }
+    return true;
+  }
+  bool is_group_valid(gid_t gid) {
+    return group_max_bytes.count(gid)? group_max_bytes[gid] >= 0 : true;
+  }
+  bool is_group_enable() const {
+    return group_max_bytes.size() > 0;
+  }
+  bool is_group_enable(gid_t gid)      {
+    auto iter = group_max_bytes.find(gid);
+    return (iter != group_max_bytes.end())? iter->second > 0 : false;
+  }
 };
 WRITE_CLASS_ENCODER(quota_info_t)
 
 inline bool operator==(const quota_info_t &l, const quota_info_t &r) {
-  return memcmp(&l, &r, sizeof(l)) == 0;
+  return l.max_bytes == r.max_bytes &&
+        l.max_files == r.max_files &&
+        l.user_max_bytes == r.user_max_bytes &&
+        l.group_max_bytes == r.group_max_bytes;
 }
 
 ostream& operator<<(ostream &out, const quota_info_t &n);
@@ -363,9 +499,6 @@ namespace std {
     }
   };
 } // namespace std
-
-
-
 
 inline std::ostream& operator<<(std::ostream &out, const vinodeno_t &vino) {
   out << vino.ino;
@@ -549,6 +682,8 @@ struct inode_t {
     truncate_from = old_size;
     size = new_size;
     rstat.rbytes = new_size;
+    rstat.user_rbytes[uid] = new_size;
+    rstat.group_rbytes[gid] = new_size;
     truncate_size = size;
     truncate_seq++;
     truncate_pending++;

@@ -2259,7 +2259,7 @@ void CInode::finish_scatter_gather_update(int type)
 
       rstat.rsubdirs = 1;
       if (const sr_t *srnode = get_projected_srnode(); srnode)
-	rstat.rsnaps = srnode->snaps.size();
+        rstat.rsnaps = srnode->snaps.size();
 
       mempool_inode *pi = get_projected_inode();
       dout(20) << "  orig rstat " << pi->rstat << dendl;
@@ -3426,6 +3426,8 @@ int CInode::encode_inodestat(bufferlist& bl, Session *session,
   if (cap) {
     cap->last_rbytes = file_i->rstat.rbytes;
     cap->last_rsize = file_i->rstat.rsize();
+    cap->last_user_rbytes = file_i->rstat.user_rbytes;
+    cap->last_group_rbytes = file_i->rstat.group_rbytes;
   }
 
   // auth
@@ -3602,6 +3604,8 @@ int CInode::encode_inodestat(bufferlist& bl, Session *session,
   encode(file_i->dirstat.nfiles, bl);
   encode(file_i->dirstat.nsubdirs, bl);
   encode(file_i->rstat.rbytes, bl);
+  encode(file_i->rstat.user_rbytes, bl);
+  encode(file_i->rstat.group_rbytes, bl);
   encode(file_i->rstat.rfiles, bl);
   encode(file_i->rstat.rsubdirs, bl);
   encode(file_i->rstat.rctime, bl);

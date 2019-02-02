@@ -31,6 +31,8 @@ public:
     encode(rstat.rbytes, payload);
     encode(rstat.rfiles, payload);
     encode(rstat.rsubdirs, payload);
+    encode(rstat.user_rbytes, payload);
+    encode(rstat.group_rbytes, payload);
     encode(quota, payload);
   }
   void decode_payload() override {
@@ -40,6 +42,8 @@ public:
     decode(rstat.rbytes, p);
     decode(rstat.rfiles, p);
     decode(rstat.rsubdirs, p);
+    decode(rstat.user_rbytes, p);
+    decode(rstat.group_rbytes, p);
     decode(quota, p);
     assert(p.end());
   }
